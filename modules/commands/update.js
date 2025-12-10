@@ -41,6 +41,73 @@ function normalizeManifest(remoteManifest) {
     return [];
 }
 
+async function getGitHubRepoVersion() {
+    try {
+        const configPath = path.resolve(__dirname, '../../config.json');
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const githubConfig = config.github || {};
+        const { owner, repo, token, branch = 'main' } = githubConfig;
+
+        if (!owner || !repo) return null;
+
+        const headers = { Accept: 'application/vnd.github.v3+json' };
+        if (token && token !== 'YOUR_GITHUB_TOKEN') {
+            headers.Authorization = `token ${token}`;
+        }
+
+        const url = `https://api.github.com/repos/${owner}/${repo}/contents/package.json?ref=${branch}`;
+        const { data } = await axios.get(url, { headers });
+        if (!data?.content) return null;
+        const content = Buffer.from(data.content, data.encoding || 'base64').toString('utf8');
+        const pkg = JSON.parse(content);
+        return pkg.version || null;
+    } catch (error) {
+        console.warn("[UPDATE] Unable to fetch GitHub repo version:", error.message);
+        return null;
+    }
+}
+
+function sendMessageAsync(api, body, threadID, replyTo) {
+    return new Promise((resolve, reject) => {
+        const callback = (err, info) => {
+            if (err) return reject(err);
+            resolve(info);
+        };
+
+        if (typeof replyTo === "undefined") {
+            api.sendMessage(body, threadID, callback);
+        } else {
+            api.sendMessage(body, threadID, callback, replyTo);
+        }
+    });
+}
+
+async function updateStatusMessage(api, threadID, text, statusCtx, replyTo) {
+    try {
+        if (statusCtx.messageID) {
+            if (typeof api.editMessage !== 'function') {
+                throw new Error("editMessage is not supported by this API instance.");
+            }
+            await Promise.resolve(api.editMessage(text, statusCtx.messageID, threadID));
+        } else {
+            const info = await sendMessageAsync(api, text, threadID, replyTo);
+            statusCtx.messageID = info.messageID;
+        }
+    } catch (error) {
+        console.warn("[UPDATE] Status message update failed:", error.message);
+        if (!statusCtx.messageID) {
+            try {
+                const info = await sendMessageAsync(api, text, threadID, replyTo);
+                statusCtx.messageID = info.messageID;
+            } catch (fallbackErr) {
+                console.warn("[UPDATE] Fallback status send failed:", fallbackErr.message);
+            }
+        }
+    }
+}
+
+const FULL_UPDATE_KEYWORDS = ["full", "all", "github", "repo"];
+
 module.exports.run = async ({ api, message, args }) => {
     const { threadID, messageID, senderID } = message;
 
@@ -49,13 +116,9 @@ module.exports.run = async ({ api, message, args }) => {
     }
 
     try {
-        // api.sendMessage("Checking for updates...", threadID, messageID);
-
-        // 1. Fetch remote update.json
         const remoteManifestUrl = `${REPO_BASE_URL}update.json`;
         const { data: remoteManifest } = await axios.get(remoteManifestUrl);
 
-        // 2. Read local package.json
         const packageJsonPath = path.resolve(__dirname, '../../package.json');
         const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
         const localVersion = packageJson.version;
@@ -66,30 +129,57 @@ module.exports.run = async ({ api, message, args }) => {
             return api.sendMessage("❌ Remote manifest does not contain any valid versions.", threadID, messageID);
         }
 
-        const newerEntries = manifestEntries.filter(entry => compareSemver(entry.version, localVersion) > 0);
+        const requestedMode = (args[0] || "").toLowerCase();
+        const isFullUpdate = FULL_UPDATE_KEYWORDS.includes(requestedMode);
+        const configPath = path.resolve(__dirname, '../../config.json');
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const hasRepoConfig = Boolean(config.github?.owner && config.github?.repo);
+
+        let baselineVersion = localVersion;
+        let baselineSource = "local";
+        let repoVersion = null;
+
+        if (isFullUpdate && hasRepoConfig) {
+            repoVersion = await getGitHubRepoVersion();
+            if (repoVersion) {
+                baselineVersion = repoVersion;
+                baselineSource = "repo";
+            }
+        }
+
+        const newerEntries = manifestEntries.filter(entry => compareSemver(entry.version, baselineVersion) > 0);
 
         if (newerEntries.length === 0) {
-            return api.sendMessage(`✅ You are already on the latest version (${localVersion}).`, threadID, messageID);
+            const msg = baselineSource === "repo"
+                ? `✅ GitHub repository is already on the latest version (${baselineVersion || "unknown"}).`
+                : `✅ You are already on the latest version (${localVersion}).`;
+            return api.sendMessage(msg, threadID, messageID);
         }
 
         const versionsToApply = [...newerEntries].sort((a, b) => compareSemver(a.version, b.version));
         const filesToUpdate = new Set();
         versionsToApply.forEach(entry => (entry.files || []).forEach(file => filesToUpdate.add(file)));
+        filesToUpdate.add('package.json');
 
         const changelogLines = versionsToApply.map(entry => `• v${entry.version}: ${entry.changelog || "No changelog provided."}`);
         const updatePlan = {
             targetVersion: versionsToApply[versionsToApply.length - 1].version,
             files: Array.from(filesToUpdate),
-            changelogLines
+            changelogLines,
+            baselineVersion,
+            baselineSource,
+            repoVersion
         };
 
-        // 3. Compare versions already done; ask for confirmation
-        const isFullUpdate = args[0] === "full";
         const filesList = updatePlan.files.length > 0
             ? updatePlan.files.map(file => `• ${file}`).join("\n")
             : "• No files listed in manifest.";
 
-        const msg = `🚀 Updates available up to v${updatePlan.targetVersion}\n\n📝 Changes since v${localVersion}:\n${changelogLines.join("\n") || "• No changelog entries."}\n\n📂 Files to update (${updatePlan.files.length}):\n${filesList}\n\nReply "yes" to update runtime files.${isFullUpdate ? "\n(This will also push changes to your GitHub repo)" : ""}`;
+        const comparisonDetail = baselineSource === "repo"
+            ? `GitHub repo version detected: v${repoVersion || "unknown"}`
+            : `Current bot version: v${localVersion}`;
+
+        const msg = `🚀 Updates available up to v${updatePlan.targetVersion}\n(${comparisonDetail})\n\n📝 Changes since v${baselineVersion}:\n${changelogLines.join("\n") || "• No changelog entries."}\n\n📂 Files to update (${updatePlan.files.length}):\n${filesList}\n\nReply "yes" to update runtime files.${isFullUpdate ? "\n(This will also push changes to your GitHub repo)" : ""}`;
 
         return api.sendMessage(msg, threadID, (err, info) => {
             if (err) return console.error(err);
@@ -119,30 +209,39 @@ module.exports.handleReply = async ({ api, message, replyData }) => {
     }
 
     api.unsendMessage(message.messageReply.messageID);
-    api.sendMessage(`🔄 Starting ${isFullUpdate ? "FULL" : "RUNTIME"} update to v${updatePlan.targetVersion}...`, threadID, messageID);
+    const statusCtx = { messageID: null };
+    await updateStatusMessage(api, threadID, `🔄 Starting ${isFullUpdate ? "FULL" : "RUNTIME"} update to v${updatePlan.targetVersion}...`, statusCtx, messageID);
+
+    const packageJsonPath = path.resolve(__dirname, '../../package.json');
 
     try {
-        // --- RUNTIME UPDATE ---
         let updatedFiles = [];
         let failedFiles = [];
-        let fileContents = {}; // Store content for GitHub push
+        let fileContents = {};
 
         for (const fileRelativePath of updatePlan.files) {
             try {
+                if (fileRelativePath === 'package.json') {
+                    updatedFiles.push(fileRelativePath);
+                    if (isFullUpdate) {
+                        const pkgContent = fs.readFileSync(packageJsonPath);
+                        fileContents[fileRelativePath] = pkgContent.toString('base64');
+                    }
+                    continue;
+                }
+
                 const fileUrl = `${REPO_BASE_URL}${fileRelativePath}`;
                 const localFilePath = path.resolve(__dirname, '../../', fileRelativePath);
 
-                // Ensure directory exists
                 const dir = path.dirname(localFilePath);
                 if (!fs.existsSync(dir)) {
                     fs.mkdirSync(dir, { recursive: true });
                 }
 
-                // Download file
                 const response = await axios({
                     method: 'get',
                     url: fileUrl,
-                    responseType: 'arraybuffer' // Use arraybuffer to handle all file types correctly
+                    responseType: 'arraybuffer'
                 });
 
                 const content = response.data;
@@ -150,7 +249,6 @@ module.exports.handleReply = async ({ api, message, replyData }) => {
 
                 updatedFiles.push(fileRelativePath);
 
-                // Store for GitHub push if needed (convert to base64 for GitHub API)
                 if (isFullUpdate) {
                     fileContents[fileRelativePath] = Buffer.from(content).toString('base64');
                 }
@@ -161,18 +259,22 @@ module.exports.handleReply = async ({ api, message, replyData }) => {
             }
         }
 
-        // Update local package.json
-        const packageJsonPath = path.resolve(__dirname, '../../package.json');
         const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
         packageJson.version = updatePlan.targetVersion;
         fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2));
+        if (!updatedFiles.includes('package.json')) {
+            updatedFiles.push('package.json');
+        }
+        if (isFullUpdate) {
+            const pkgContent = fs.readFileSync(packageJsonPath);
+            fileContents['package.json'] = pkgContent.toString('base64');
+        }
 
         let reportMsg = `✅ Runtime Update Complete!\n🆕 Version: ${updatePlan.targetVersion}\n📂 Updated: ${updatedFiles.length}`;
         if (failedFiles.length > 0) reportMsg += `\n⚠️ Failed: ${failedFiles.length}`;
 
-        // --- GITHUB UPDATE (Full Mode) ---
         if (isFullUpdate && updatedFiles.length > 0) {
-            api.sendMessage("☁️ Pushing changes to GitHub...", threadID, messageID);
+            await updateStatusMessage(api, threadID, "☁️ Pushing changes to GitHub...", statusCtx);
             try {
                 const configPath = path.resolve(__dirname, '../../config.json');
                 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -181,7 +283,6 @@ module.exports.handleReply = async ({ api, message, replyData }) => {
                 if (!token || !owner || !repo || token === "YOUR_GITHUB_TOKEN") {
                     reportMsg += "\n\n❌ GitHub Push Failed: Missing or invalid GitHub config.";
                 } else {
-                    // Push each file
                     let pushedCount = 0;
                     for (const filePath of updatedFiles) {
                         const contentBase64 = fileContents[filePath];
@@ -196,15 +297,14 @@ module.exports.handleReply = async ({ api, message, replyData }) => {
             }
         }
 
-        api.sendMessage(reportMsg, threadID, messageID);
+        await updateStatusMessage(api, threadID, reportMsg, statusCtx);
 
     } catch (error) {
         console.error("Update execution failed:", error);
-        api.sendMessage(`❌ Update failed: ${error.message}`, threadID, messageID);
+        await updateStatusMessage(api, threadID, `❌ Update failed: ${error.message}`, statusCtx);
     }
 };
 
-// Helper function to push to GitHub
 async function pushToGitHub(token, owner, repo, path, contentBase64, message) {
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
     const headers = {
@@ -213,17 +313,14 @@ async function pushToGitHub(token, owner, repo, path, contentBase64, message) {
     };
 
     try {
-        // 1. Get current file SHA (if it exists)
         let sha;
         try {
             const { data } = await axios.get(url, { headers });
             sha = data.sha;
         } catch (e) {
             if (e.response && e.response.status !== 404) throw e;
-            // File doesn't exist, so no SHA needed
         }
 
-        // 2. Create/Update file
         await axios.put(url, {
             message,
             content: contentBase64,
