@@ -15,7 +15,7 @@ module.exports.config = {
 };
 
 // REPLACE THIS WITH YOUR RAW REPOSITORY URL
-const REPO_BASE_URL = "https://gitlab.com/priyanshufsdev/test/-/raw/main/";
+const REPO_BASE_URL = "https://gitlab.com/priyanshufsdev/priyanshu-fb-bot/-/raw/main/";
 
 function parseSemver(version) {
     if (typeof version !== "string") return [0, 0, 0];
@@ -85,7 +85,11 @@ module.exports.run = async ({ api, message, args }) => {
 
         // 3. Compare versions already done; ask for confirmation
         const isFullUpdate = args[0] === "full";
-        const msg = `🚀 Updates available up to v${updatePlan.targetVersion}\n\n📝 Changes since v${localVersion}:\n${changelogLines.join("\n")}\n\n📂 Files to update: ${updatePlan.files.length}\n\nReply "yes" to update runtime files.${isFullUpdate ? "\n(This will also push changes to your GitHub repo)" : ""}`;
+        const filesList = updatePlan.files.length > 0
+            ? updatePlan.files.map(file => `• ${file}`).join("\n")
+            : "• No files listed in manifest.";
+
+        const msg = `🚀 Updates available up to v${updatePlan.targetVersion}\n\n📝 Changes since v${localVersion}:\n${changelogLines.join("\n") || "• No changelog entries."}\n\n📂 Files to update (${updatePlan.files.length}):\n${filesList}\n\nReply "yes" to update runtime files.${isFullUpdate ? "\n(This will also push changes to your GitHub repo)" : ""}`;
 
         return api.sendMessage(msg, threadID, (err, info) => {
             if (err) return console.error(err);
